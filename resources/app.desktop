@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=BigBox
+Comment=Book classes at BigBox Leisure Club
+Type=Application
+Icon=com.orta.bigbox-for-cosmic
+Exec=bigbox-for-cosmic %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC;HealthAndFitness;
+Keywords=gym;fitness;classes;booking;
+MimeType=
