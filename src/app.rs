@@ -4,7 +4,9 @@ use crate::config::{Config, Friend};
 use crate::fl;
 use bigbox_for_cosmic::api::{self, ApiError, Attendee, ClassEvent, Directory, Profile};
 use bigbox_for_cosmic::categories::{self, Category};
-use chrono::{Duration, Local, NaiveDate};
+use bigbox_for_cosmic::caldav::{self, CalDavError, SyncOutcome};
+use bigbox_for_cosmic::calendar;
+use chrono::{Duration, Local, NaiveDate, Utc};
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
@@ -95,7 +97,31 @@ pub struct AppModel {
     pending: HashSet<String>,
     /// Transient confirmation of the last completed booking action.
     status: Option<String>,
+
+    // --- Calendar sync (what persists lives in `config.calendar`) ---
+    settings_open: bool,
+    /// `None` until credentials have been accepted. Shared with the sync
+    /// tasks, which is why it's behind an `Arc`.
+    caldav: Option<Arc<caldav::Client>>,
+    /// Writable calendars on the connected account.
+    calendars: Vec<caldav::Calendar>,
+    /// The dialog's credential fields, kept apart from the saved ones so
+    /// typing a replacement doesn't discard working credentials until they've
+    /// been accepted.
+    calendar_username: String,
+    calendar_password: String,
+    connecting_calendar: bool,
+    syncing_calendar: bool,
+    calendar_error: Option<String>,
+    calendar_status: Option<String>,
+    /// The event set last written. Bookings are re-read on every refresh, so
+    /// without this the app would talk to the server each time to say nothing
+    /// had changed.
+    synced_events: Option<Vec<calendar::Event>>,
 }
+
+/// A connected CalDAV session together with the calendars it can write to.
+type CalendarConnection = Result<(Arc<caldav::Client>, Vec<caldav::Calendar>), CalDavError>;
 
 /// Messages emitted by the application and its widgets.
 #[derive(Debug, Clone)]
@@ -131,6 +157,21 @@ pub enum Message {
     RemoveFriend(usize),
     FriendSignedIn(usize, Box<Result<Arc<api::Client>, ApiError>>),
     FriendBookingsLoaded(usize, Box<Result<Vec<Attendee>, ApiError>>),
+
+    // Calendar sync
+    OpenSettings,
+    CloseSettings,
+    CalendarUsernameChanged(String),
+    CalendarPasswordChanged(String),
+    ConnectCalendar,
+    /// The client and the account's calendars, resolved together so the dialog
+    /// never shows a connected account with nothing to pick from.
+    CalendarConnected(Box<CalendarConnection>),
+    SelectCalendar(usize),
+    ToggleCalendarSync(bool),
+    SyncCalendar,
+    CalendarSynced(Box<Result<SyncOutcome, CalDavError>>),
+    DisconnectCalendar,
 
     // Chrome
     LaunchUrl(String),
@@ -220,6 +261,16 @@ impl cosmic::Application for AppModel {
             friend_form_error: None,
             pending: HashSet::new(),
             status: None,
+            settings_open: false,
+            caldav: None,
+            calendars: Vec::new(),
+            calendar_username: String::new(),
+            calendar_password: String::new(),
+            connecting_calendar: false,
+            syncing_calendar: false,
+            calendar_error: None,
+            calendar_status: None,
+            synced_events: None,
         };
 
         // Saved credentials mean the user never has to see the sign-in form.
@@ -230,9 +281,13 @@ impl cosmic::Application for AppModel {
             Task::none()
         };
 
+        // Reconnecting up front means bookings sync on launch without the
+        // settings dialog ever being opened.
+        let calendar_task = app.connect_calendar();
+
         let title_task = app.update_title();
 
-        (app, Task::batch([login_task, title_task]))
+        (app, Task::batch([login_task, calendar_task, title_task]))
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
@@ -240,7 +295,11 @@ impl cosmic::Application for AppModel {
             menu::root(fl!("view")).apply(Element::from),
             menu::items(
                 &self.key_binds,
-                vec![menu::Item::Button(fl!("about"), None, MenuAction::About)],
+                vec![
+                    menu::Item::Button(fl!("settings"), None, MenuAction::Settings),
+                    menu::Item::Divider,
+                    menu::Item::Button(fl!("about"), None, MenuAction::About),
+                ],
             ),
         )]);
 
@@ -264,6 +323,10 @@ impl cosmic::Application for AppModel {
                 Message::ToggleContextPage(ContextPage::About),
             ),
         })
+    }
+
+    fn dialog(&self) -> Option<Element<'_, Self::Message>> {
+        self.settings_open.then(|| self.view_settings())
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -339,6 +402,10 @@ impl cosmic::Application for AppModel {
                 self.login_error = None;
                 self.status = None;
                 self.config.password.clear();
+                // The emptied booking list is not a statement that the calendar
+                // should be emptied too, so forget what was synced rather than
+                // let the next sign-in diff against it.
+                self.synced_events = None;
                 // Friends' sessions are separate logins; drop them too rather
                 // than leave someone else's data on screen.
                 self.friend_states = vec![FriendState::Idle; self.config.friends.len()];
@@ -347,7 +414,12 @@ impl cosmic::Application for AppModel {
             }
 
             Message::DirectoryLoaded(result) => match *result {
-                Ok(directory) => self.directory = directory,
+                Ok(directory) => {
+                    self.directory = directory;
+                    // Class names and the club's timezone come from here, so
+                    // this arriving is often what unblocks the first sync.
+                    return self.sync_calendar(false);
+                }
                 Err(error) => return self.handle_error(error, |app, msg| app.planning_error = msg),
             },
 
@@ -370,6 +442,9 @@ impl cosmic::Application for AppModel {
                     Ok(bookings) => {
                         self.bookings = bookings;
                         self.bookings_error = None;
+                        // The one place the calendar's source of truth changes,
+                        // so every booking, cancellation and refresh lands here.
+                        return self.sync_calendar(false);
                     }
                     Err(error) => {
                         return self.handle_error(error, |app, msg| app.bookings_error = msg);
@@ -524,6 +599,147 @@ impl cosmic::Application for AppModel {
                 };
             }
 
+            Message::OpenSettings => {
+                self.settings_open = true;
+                self.calendar_error = None;
+                // Credentials saved from a previous run are already connected,
+                // so only prefill when there's nothing to reconnect. The
+                // username defaults to the BigBox login, which for most people
+                // is the same address.
+                if self.caldav.is_none() && !self.connecting_calendar {
+                    self.calendar_username = if self.config.calendar.username.is_empty() {
+                        self.config.email.clone()
+                    } else {
+                        self.config.calendar.username.clone()
+                    };
+                    self.calendar_password = self.config.calendar.password.clone();
+                }
+            }
+
+            Message::CloseSettings => {
+                self.settings_open = false;
+                self.calendar_status = None;
+            }
+
+            Message::CalendarUsernameChanged(username) => {
+                self.calendar_username = username;
+                self.calendar_error = None;
+            }
+
+            Message::CalendarPasswordChanged(password) => {
+                self.calendar_password = password;
+                self.calendar_error = None;
+            }
+
+            Message::ConnectCalendar => {
+                let username = self.calendar_username.trim().to_string();
+                if username.is_empty() || self.calendar_password.is_empty() {
+                    return Task::none();
+                }
+                self.config.calendar.username = username;
+                self.config.calendar.password = self.calendar_password.clone();
+                self.save_config();
+                return self.connect_calendar();
+            }
+
+            Message::CalendarConnected(result) => {
+                self.connecting_calendar = false;
+                match *result {
+                    Ok((client, calendars)) => {
+                        self.caldav = Some(client);
+                        self.calendars = calendars;
+                        self.calendar_error = None;
+
+                        // A calendar that's been deleted or unshared since it
+                        // was chosen would otherwise leave sync quietly
+                        // pointing at nothing.
+                        let chosen = &self.config.calendar.calendar_href;
+                        if !chosen.is_empty()
+                            && !self.calendars.iter().any(|cal| cal.href == *chosen)
+                        {
+                            self.config.calendar.calendar_href.clear();
+                            self.config.calendar.calendar_name.clear();
+                            self.config.calendar.enabled = false;
+                            self.save_config();
+                        }
+
+                        return self.sync_calendar(false);
+                    }
+                    Err(error) => {
+                        self.caldav = None;
+                        self.calendars.clear();
+                        self.calendar_error = Some(error.to_string());
+                    }
+                }
+            }
+
+            Message::SelectCalendar(index) => {
+                let Some(calendar) = self.calendars.get(index) else {
+                    return Task::none();
+                };
+                self.config.calendar.calendar_href = calendar.href.clone();
+                self.config.calendar.calendar_name = calendar.display_name().to_string();
+                self.save_config();
+                // Whatever was written to the old calendar is left where it is
+                // rather than chased down and deleted, so this is a fresh start.
+                self.synced_events = None;
+                return self.sync_calendar(true);
+            }
+
+            Message::ToggleCalendarSync(enabled) => {
+                self.config.calendar.enabled = enabled;
+                self.save_config();
+                if enabled {
+                    return self.sync_calendar(true);
+                }
+                // Turning sync off stops the app writing; it deliberately
+                // doesn't tidy up after itself, because silently deleting a
+                // fortnight of events from someone's calendar is not what
+                // "off" should mean.
+                self.calendar_status = None;
+            }
+
+            Message::SyncCalendar => return self.sync_calendar(true),
+
+            Message::CalendarSynced(result) => {
+                self.syncing_calendar = false;
+                match *result {
+                    Ok(outcome) => {
+                        self.calendar_error = None;
+                        self.calendar_status = Some(if outcome.is_empty() {
+                            fl!("calendar-synced")
+                        } else {
+                            fl!(
+                                "calendar-sync-result",
+                                created = outcome.created,
+                                updated = outcome.updated,
+                                removed = outcome.removed
+                            )
+                        });
+                    }
+                    Err(error) => {
+                        // The write didn't land, so the record of what's on the
+                        // calendar is now wrong — drop it or the next attempt
+                        // would decide there was nothing to do.
+                        self.synced_events = None;
+                        self.calendar_status = None;
+                        self.calendar_error = Some(error.to_string());
+                    }
+                }
+            }
+
+            Message::DisconnectCalendar => {
+                self.caldav = None;
+                self.calendars.clear();
+                self.calendar_username.clear();
+                self.calendar_password.clear();
+                self.synced_events = None;
+                self.calendar_error = None;
+                self.calendar_status = None;
+                self.config.calendar = Default::default();
+                self.save_config();
+            }
+
             Message::ToggleContextPage(context_page) => {
                 if self.context_page == context_page {
                     self.core.window.show_context = !self.core.window.show_context;
@@ -614,6 +830,75 @@ impl AppModel {
             move |result| {
                 cosmic::Action::App(Message::FriendBookingsLoaded(index, Box::new(result)))
             },
+        )
+    }
+
+    /// Resolves the saved credentials into a live session and the account's
+    /// calendars. Does nothing when nothing has been saved.
+    fn connect_calendar(&mut self) -> Task<cosmic::Action<Message>> {
+        if !self.config.calendar.has_credentials() {
+            return Task::none();
+        }
+        let (username, password) = (
+            self.config.calendar.username.clone(),
+            self.config.calendar.password.clone(),
+        );
+
+        self.connecting_calendar = true;
+        self.calendar_error = None;
+
+        Task::perform(
+            async move {
+                let client = caldav::Client::new(&username, &password);
+                // Discovery is also the credential check — there's no cheaper
+                // request that proves the password is good.
+                let calendars = client.calendars().await?;
+                Ok((Arc::new(client), calendars))
+            },
+            |result| cosmic::Action::App(Message::CalendarConnected(Box::new(result))),
+        )
+    }
+
+    /// Mirrors the current bookings onto the chosen calendar.
+    ///
+    /// Unless `force`, this is a no-op when the events work out identical to
+    /// the last set written — bookings are re-read on every refresh and page
+    /// change, and almost none of those change anything.
+    fn sync_calendar(&mut self, force: bool) -> Task<cosmic::Action<Message>> {
+        if !self.config.calendar.is_active() {
+            return Task::none();
+        }
+        let Some(client) = self.caldav.clone() else {
+            return Task::none();
+        };
+        // Without the directory there are no class names and no club timezone,
+        // and an event called "Class" at the wrong hour is worse than waiting.
+        if self.directory.activities.is_empty() {
+            return Task::none();
+        }
+
+        let events = calendar::desired_events(
+            &self.bookings,
+            &self.directory,
+            Local::now().naive_local(),
+        );
+
+        if !force && self.synced_events.as_ref() == Some(&events) {
+            return Task::none();
+        }
+
+        self.syncing_calendar = true;
+        self.calendar_error = None;
+        self.synced_events = Some(events.clone());
+
+        let calendar_href = self.config.calendar.calendar_href.clone();
+        // Matches the cutoff `desired_events` used, so the two sides agree on
+        // which events are in scope to be reconciled.
+        let after = Utc::now();
+
+        Task::perform(
+            async move { client.sync(&calendar_href, &events, after).await },
+            |result| cosmic::Action::App(Message::CalendarSynced(Box::new(result))),
         )
     }
 
@@ -779,6 +1064,126 @@ impl AppModel {
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center)
             .into()
+    }
+
+    /// The settings modal, which so far is only about calendar sync.
+    ///
+    /// It has three shapes: no token yet, connecting, and connected with a
+    /// calendar to pick.
+    fn view_settings(&self) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+        let mut body = widget::column::with_capacity(8).spacing(spacing.space_s);
+
+        match &self.caldav {
+            None => {
+                body = body.push(widget::text::caption(fl!("calendar-password-help")));
+                body = body.push(
+                    widget::text_input(fl!("email"), &self.calendar_username)
+                        .on_input(Message::CalendarUsernameChanged),
+                );
+                body = body.push(
+                    widget::secure_input(
+                        fl!("calendar-password"),
+                        &self.calendar_password,
+                        None::<Message>,
+                        true,
+                    )
+                    .on_input(Message::CalendarPasswordChanged)
+                    .on_submit(|_| Message::ConnectCalendar),
+                );
+                body = body.push(
+                    widget::button::link(fl!("calendar-get-password")).on_press(
+                        Message::LaunchUrl(caldav::APP_PASSWORD_URL.to_string()),
+                    ),
+                );
+                if self.connecting_calendar {
+                    body = body.push(widget::text(fl!("calendar-connecting")));
+                }
+            }
+
+            Some(client) => {
+                let username = client.username().to_string();
+                if !username.is_empty() {
+                    body = body.push(widget::text(fl!("calendar-connected-as", username = username)));
+                }
+
+                if self.calendars.is_empty() {
+                    body = body.push(widget::text(fl!("calendar-none-writable")));
+                } else {
+                    let names: Vec<String> = self
+                        .calendars
+                        .iter()
+                        .map(|calendar| calendar.display_name().to_string())
+                        .collect();
+                    let selected = self
+                        .calendars
+                        .iter()
+                        .position(|calendar| calendar.href == self.config.calendar.calendar_href);
+
+                    let mut section = widget::settings::section().add(
+                        widget::settings::item::builder(fl!("calendar-choose")).control(
+                            widget::dropdown(names, selected, Message::SelectCalendar),
+                        ),
+                    );
+
+                    // The toggle only means anything once there's somewhere to
+                    // write to, so it stays inert until a calendar is chosen.
+                    if selected.is_some() {
+                        section = section.add(
+                            widget::settings::item::builder(fl!("calendar-enable")).control(
+                                widget::toggler(self.config.calendar.enabled)
+                                    .on_toggle(Message::ToggleCalendarSync),
+                            ),
+                        );
+                    }
+
+                    body = body.push(section);
+
+                    if selected.is_none() {
+                        body = body.push(widget::text::caption(fl!("calendar-needs-calendar")));
+                    }
+                }
+
+                if self.syncing_calendar {
+                    body = body.push(widget::text(fl!("calendar-syncing")));
+                } else if let Some(status) = &self.calendar_status {
+                    body = body.push(widget::text::caption(status.as_str()));
+                }
+            }
+        }
+
+        if let Some(error) = &self.calendar_error {
+            body = body.push(widget::text(error.as_str()));
+        }
+
+        let mut dialog = widget::dialog()
+            .title(fl!("calendar-sync"))
+            .body(fl!("calendar-explainer"))
+            .control(body)
+            .primary_action(
+                widget::button::suggested(fl!("close")).on_press(Message::CloseSettings),
+            );
+
+        if self.caldav.is_some() {
+            if self.config.calendar.is_active() && !self.syncing_calendar {
+                dialog = dialog.secondary_action(
+                    widget::button::standard(fl!("calendar-sync-now"))
+                        .on_press(Message::SyncCalendar),
+                );
+            }
+            dialog = dialog.tertiary_action(
+                widget::button::destructive(fl!("calendar-disconnect"))
+                    .on_press(Message::DisconnectCalendar),
+            );
+        } else if !self.connecting_calendar {
+            let mut connect = widget::button::standard(fl!("calendar-connect"));
+            if !self.calendar_username.trim().is_empty() && !self.calendar_password.is_empty() {
+                connect = connect.on_press(Message::ConnectCalendar);
+            }
+            dialog = dialog.secondary_action(connect);
+        }
+
+        dialog.into()
     }
 
     fn view_planning(&self) -> Element<'_, Message> {
@@ -1277,6 +1682,7 @@ pub enum ContextPage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
     About,
+    Settings,
 }
 
 impl menu::action::MenuAction for MenuAction {
@@ -1285,6 +1691,7 @@ impl menu::action::MenuAction for MenuAction {
     fn message(&self) -> Self::Message {
         match self {
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
+            MenuAction::Settings => Message::OpenSettings,
         }
     }
 }

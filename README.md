@@ -27,6 +27,54 @@ the classes on the planning grid, so you can see what they're doing before you b
 Classes that have already started are dimmed and marked *Finished*, so the day still reads as a
 whole without them looking bookable.
 
+**Calendar sync.** *View → Settings* connects a Fastmail account over CalDAV and mirrors your booked
+classes into one of its calendars, so they turn up wherever you read your calendar rather than only
+here. Waiting-list places sync too, marked tentative and transparent rather than busy, since they're
+a maybe.
+
+## Calendar sync
+
+[`src/calendar.rs`](./src/calendar.rs) works out which events the calendar *should* hold, as a pure
+function of your bookings. [`src/caldav.rs`](./src/caldav.rs) is a CalDAV client that makes the
+server match. Keeping those apart is what let the transport be swapped without touching the rest —
+which turned out to matter.
+
+This was first built against [JMAP][jmap], on the reasoning that it's Fastmail's own JSON API, needs
+no XML parser and authenticates with a scoped API token. That turned out not to work. Fastmail's
+[developer docs][fastmail-dev] say calendars are reachable "via CalDAV… we will be opening up JMAP
+access as well, as soon as the specification is finalized", [JMAP for Calendars][jmap-calendars] is
+still a draft rather than an RFC, and a real token against a real account confirmed it — the session
+advertises no calendar capability at all. So CalDAV it is, which has the consolation of being
+portable to iCloud, Nextcloud and anything else that speaks it.
+
+Sign in with your Fastmail address and an **app password**, not your account password — CalDAV
+requires one, and it's revocable on its own, which is a better thing to keep in a plain-text config
+file.
+
+Four design notes that are easy to get wrong:
+
+- **Discovery is three hops**, not a guessed URL: `current-user-principal`, then `calendar-home-set`,
+  then the calendars. Fastmail's paths are predictable right up until they aren't.
+- **Times go out as UTC.** iCalendar can't pair a local time with a zone without also emitting a
+  `VTIMEZONE` carrying that zone's full DST rules, so the club's naive wall-clock times are converted
+  through its IANA zone with `chrono-tz`. There's a test pinning both a BST and a GMT date, because
+  being an hour out for half the year is the most likely way for this to be quietly useless.
+- **The sync cutoff is a class's *end*, not its start.** A sync deletes anything the server holds in
+  its window that the app didn't list, and a CalDAV `time-range` with only a start matches events
+  that haven't ended. Cutting at the start time instead would leave a class that's under way visible
+  to the server but absent from the desired set — and it would vanish from your calendar halfway
+  through.
+- **Resource names avoid `@`.** Events live at `{calendar}/bigbox-{id}.ics`, so a `PUT` is
+  create-or-update with no read first. The iCalendar `UID` keeps its `@bigbox-for-cosmic` suffix, but
+  the *file name* doesn't, because some servers percent-encode `@` in returned hrefs and some don't —
+  which would make matching a returned href back to an event unreliable.
+
+Only events this app wrote are ever touched: they carry a `bigbox-…@bigbox-for-cosmic` UID, and
+anything else in the chosen calendar is left strictly alone. Existing events are *patched* rather
+than replaced, so a reminder you added yourself survives a re-sync. Turning sync off stops the app
+writing but deliberately doesn't tidy up after itself — silently deleting a fortnight of events from
+someone's calendar is not what "off" should mean.
+
 ## Class categories
 
 BigBox's API does expose its own `activity_groups`, but they're too coarse to browse by and wrong in
@@ -96,8 +144,9 @@ It is recommended to build a source tarball with the vendored dependencies, whic
 
 Developers should install [rustup][rustup] and configure their editor to use [rust-analyzer][rust-analyzer]. To improve compilation times, disable LTO in the release profile, install the [mold][mold] linker, and configure [sccache][sccache] for use with Rust. The [mold][mold] linker will only improve link times if LTO is disabled.
 
-Run `cargo test` for the unit tests — they cover the category table, the search matching, and the
-capacity and booking-state logic in the API client.
+Run `cargo test` for the unit tests — they cover the category table, the search matching, the
+capacity and booking-state logic in the API client, and the calendar sync's event building and
+cutoff rules.
 
 ### A note on credentials
 
@@ -108,7 +157,10 @@ seeing what someone is going to means signing in as them with credentials they'v
 
 [bigbox]: https://www.bigboxleisureclub.co.uk/
 [cosmic]: https://system76.com/cosmic
+[fastmail-dev]: https://www.fastmail.com/dev/
 [fluent]: https://projectfluent.org/
+[jmap]: https://jmap.io/
+[jmap-calendars]: https://jmap.io/spec/calendars-draft/
 [fluent-guide]: https://projectfluent.org/fluent/guide/hello.html
 [iso-codes]: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
 [just]: https://github.com/casey/just

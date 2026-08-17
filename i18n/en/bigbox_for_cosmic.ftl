@@ -4,6 +4,7 @@ app-keywords = gym;fitness;classes;booking;
 about = About
 repository = Repository
 view = View
+settings = Settings
 git-description = Git commit {$hash} on {$date}
 
 ## Pages
@@ -69,3 +70,24 @@ friend-booking-count =
         [one] 1 upcoming booking
        *[other] { $count } upcoming bookings
     }
+
+## Calendar sync
+
+calendar-sync = Calendar sync
+calendar-explainer = Mirror your booked classes into a Fastmail calendar, so they show up wherever you read your calendar. Waiting-list places are added too, marked as tentative.
+calendar-password = App password
+calendar-password-help = Sign in over CalDAV with your Fastmail address and an app password with calendar access — not your normal login password.
+calendar-get-password = Create an app password
+calendar-connect = Connect
+calendar-connecting = Signing in…
+calendar-connected-as = Connected as { $username }
+calendar-disconnect = Disconnect
+calendar-choose = Calendar to sync to
+calendar-none-writable = No calendars on that account can be written to
+calendar-enable = Sync booked classes
+calendar-sync-now = Sync now
+calendar-syncing = Syncing…
+calendar-synced = Calendar is up to date
+calendar-sync-result = Calendar updated — { $created } added, { $updated } changed, { $removed } removed
+calendar-needs-calendar = Pick a calendar to sync to
+close = Close
