@@ -4,4 +4,6 @@
 //! be driven from tests and the `examples/` directory.
 
 pub mod api;
+pub mod caldav;
+pub mod calendar;
 pub mod categories;

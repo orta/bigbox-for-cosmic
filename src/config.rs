@@ -26,6 +26,38 @@ impl Friend {
     }
 }
 
+/// Where booked classes get mirrored to, over CalDAV.
+///
+/// Stored in plain text like everything else here. An *app password* is the
+/// right credential to put in this file rather than the account's real one:
+/// it's revocable on its own, and it's what Fastmail requires for CalDAV in any
+/// case.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CalendarSync {
+    /// Fastmail address the app password belongs to.
+    pub username: String,
+    /// App password, not the account login.
+    pub password: String,
+    /// Path of the chosen calendar collection on the server.
+    pub calendar_href: String,
+    /// Kept alongside the href so the settings dialog can name the chosen
+    /// calendar before the server has been re-contacted on launch.
+    pub calendar_name: String,
+    /// Off by default, and left off until a calendar has actually been picked.
+    pub enabled: bool,
+}
+
+impl CalendarSync {
+    pub fn has_credentials(&self) -> bool {
+        !self.username.is_empty() && !self.password.is_empty()
+    }
+
+    /// Whether there's enough here to attempt a sync.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.has_credentials() && !self.calendar_href.is_empty()
+    }
+}
+
 #[derive(Debug, Default, Clone, CosmicConfigEntry, Eq, PartialEq)]
 #[version = 1]
 pub struct Config {
@@ -37,6 +69,10 @@ pub struct Config {
     pub password: String,
     /// Friends whose bookings show up on the planning grid.
     pub friends: Vec<Friend>,
+    /// Fastmail calendar mirroring. Each field of a config entry is its own
+    /// file on disk, so this being absent from an older config is not an error
+    /// — it just reads back as the default.
+    pub calendar: CalendarSync,
 }
 
 impl Config {
